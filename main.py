@@ -29,6 +29,7 @@ import re
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
 import textwrap
+from datetime import datetime
 
 # --- 依存パッケージのインポート（利用環境でインストールされている前提） ---
 try:
@@ -285,53 +286,161 @@ def agent_b_check(llm: ChatOpenAI, rule_summary: str, rule_raw: Dict[str, Any], 
     """
     context = "\n\n".join([f"[src:{d.metadata.get('source')}]\n{d.page_content}" for d in docs[:TOP_K]])
 
-    prompt = (
-        "あなたは技術的な評価者です。以下のルール要約と元ルールを読み、与えられたシステム情報がそのルールに従っているかを評価してください。"
-        "出力は JSON で、keys は 'result'（〇/△/×）、'evidence'（根拠となる抜粋や説明）、'details'（追加情報） としてください。"
-        "\n\n重要: 回答は必ず日本語で行ってください。JSON のキーは英語のままで構いませんが、値や説明文は日本語で記載してください。"
-    )
-    messages = [
-        SystemMessage(content=prompt),
-        HumanMessage(content=f"ルール要約:\n{rule_summary}\n\n元ルール(raw):\n{json.dumps(rule_raw, ensure_ascii=False)}\n\nドキュメントコンテキスト:\n{context}")
-    ]
+    # 厳密な JSON 出力を促すプロンプト（スキーマと例を明示）
+    strict_prompt = """
+あなたは技術的な評価者です。以下のルール要約と元ルールを読み、与えられたシステム情報がそのルールに従っているかを評価してください。
+
+出力は厳密な JSON のみを返してください。余計な説明や追加テキストは一切書かず、必ず純粋な JSON テキストだけを返してください（コードフェンスや説明を含めないでください）。
+
+JSON スキーマ例:
+{
+    "result": "〇|△|×",            // 判定
+    "evidence": [                   // 推奨: 配列形式
+        {"source": "ファイル名や識別子", "excerpt": "抜粋テキスト..."}
+    ],
+    "details": "追加の説明(任意)"
+}
+
+重要: JSON のキー名は英語のままにし、値や説明文は日本語で記載してください。
+"""
+
+    init_human = HumanMessage(content=f"ルール要約:\n{rule_summary}\n\n元ルール(raw):\n{json.dumps(rule_raw, ensure_ascii=False)}\n\nドキュメントコンテキスト:\n{context}")
+
+    messages = [SystemMessage(content=strict_prompt), init_human]
+
+    # 最初の回答を取得
     resp = llm(messages)
     # モデルに JSON 形式で答えるよう指示したが、念のためパースを試みる
     text = resp.content
+
+    # デバッグ用: 生出力をログに残す（短縮版）
+    logger.debug("Agent B raw output (head 1000 chars): %s", text[:1000].replace('\n', '\\n'))
+
+    # 万が一のため、失敗した生出力をファイルへ追記するユーティリティ
+    def _save_model_output(rule_id: str, content: str):
+        try:
+            logs_dir = BASE_DIR / "logs"
+            logs_dir.mkdir(exist_ok=True)
+            ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+            fname = logs_dir / f"agent_b_output_{ts}_{str(rule_id)[:60].replace(' ', '_')}.log"
+            with open(fname, "w", encoding="utf-8") as lf:
+                lf.write("--- RAW MODEL OUTPUT ---\n")
+                lf.write(content)
+            logger.info("モデル出力をログに保存しました: %s", fname)
+        except Exception as e:
+            logger.debug("モデル出力ログ保存に失敗しました: %s", e)
+
+    # 保存は任意（環境変数で無効化可能）
+    if os.environ.get("SAVE_MODEL_OUTPUT", "1") != "0":
+        try:
+            _save_model_output(rule_raw.get("id") or rule_raw.get("title") or "unknown", text)
+        except Exception:
+            pass
+
+    parsed = None
+    # まず素直に JSON としてデコードを試みる
     try:
         parsed = json.loads(text)
     except Exception:
-        # JSON にできない場合は、出力テキストからヒューリスティックに値を抽出して正規化する
+        parsed = None
+
+    # もしパース失敗したらモデルに再試行を促す（最大2回）
+    retries = 0
+    while parsed is None and retries < 2:
+        retries += 1
+        logger.info("JSON パース失敗: モデルへ再試行を行います (試行 %d)。", retries)
+        followup = (
+            "前の回答は有用でしたが、要求された通り厳密な JSON のみで出力されていませんでした。"
+            "以下の JSON スキーマに厳密に合わせ、純粋な JSON テキストのみを出力してください。"
+            "\n\nスキーマ: {\"result\":\"〇|△|×\", \"evidence\": [ {\"source\":..., \"excerpt\":...} ], \"details\": \"任意の文字列\" }"
+            "\n\n元の出力を参照して、上記スキーマにマッピングして JSON のみを返してください。"
+        )
+        follow_messages = [SystemMessage(content=strict_prompt), init_human, HumanMessage(content=followup + "\n\n前の出力:\n" + text)]
+        try:
+            resp2 = llm(follow_messages)
+            text2 = resp2.content
+            logger.debug("Agent B retry raw output (head 1000): %s", text2[:1000].replace('\n', '\\n'))
+            # まず素直に JSON としてデコードを試みる
+            try:
+                parsed = json.loads(text2)
+                text = text2
+                break
+            except Exception:
+                # 次に波括弧ブロックを抽出
+                m2 = re.search(r"(\{[\s\S]*\})", text2)
+                if m2:
+                    try:
+                        parsed = json.loads(m2.group(1))
+                        text = m2.group(1)
+                        break
+                    except Exception:
+                        parsed = None
+                # 最後に簡易変換を試す
+                t2 = text2.replace("'", '"')
+                t2 = re.sub(r",\s*([}\]])", r"\1", t2)
+                t2 = re.sub(r'([\{,\s])(\w+)\s*:', r'\1"\2":', t2)
+                try:
+                    parsed = json.loads(t2)
+                    text = t2
+                    break
+                except Exception:
+                    parsed = None
+        except Exception as e:
+            logger.debug("モデル再試行中に例外: %s", e)
+            parsed = None
+
+    # ここまでで parsed が None ならオリジナル text を用いてフォールバック処理へ
+    if parsed is None:
+        # JSON の部分文字列を抜き出す試み
+        # 1) 最初の波括弧ブロックを抽出して試す
+        m = re.search(r"(\{[\s\S]*\})", text)
+        if m:
+            candidate = m.group(1)
+            try:
+                parsed = json.loads(candidate)
+            except Exception:
+                parsed = None
+
+        # 2) シングルクォートをダブルクォートに変換、末尾の余分なカンマを削除、未引用キーに引用付与を試す
+        if parsed is None:
+            t2 = text.replace("'", '"')
+            t2 = re.sub(r",\s*([}\]])", r"\1", t2)
+            t2 = re.sub(r'([\{,\s])(\w+)\s*:', r'\1"\2":', t2)
+            try:
+                parsed = json.loads(t2)
+            except Exception:
+                parsed = None
+
+    # 最終的にパースできなければヒューリスティック抽出へ
+    if parsed is None:
         logger.warning("モデルの出力を JSON としてパースできませんでした。ヒューリスティック抽出を試みます。")
 
         def _heuristic_parse(text: str) -> Dict[str, Any]:
-            # 目的: text 中の result, evidence, details を正規表現で抽出して辞書で返す
             out: Dict[str, Any] = {}
             # result (期待値: 〇/△/× または O/X など)
-            m = re.search(r"['\"]?result['\"]?\s*:\s*['\"]?([^\"',}\n\r]+)", text, re.IGNORECASE)
+            m = re.search(r"['\"]?result['\"]?\s*[:：]\s*['\"]?([^\"',}\n\r]+)", text, re.IGNORECASE)
             if m:
                 out["result"] = m.group(1).strip().strip('"\'')
             else:
-                # 日本語の説明文に単独で '〇' 等がある場合を探す（厳密ではない）
                 m2 = re.search(r"\b(〇|△|×|O|X|o|x)\b", text)
                 if m2:
                     out["result"] = m2.group(1)
 
             # evidence: try to extract the value after evidence key (allow multiline)
-            m_e = re.search(r"['\"]?evidence['\"]?\s*:\s*([\"'])(.*?)\1", text, re.IGNORECASE | re.DOTALL)
+            m_e = re.search(r"['\"]?evidence['\"]?\s*[:：]\s*([\"'])(.*?)\1", text, re.IGNORECASE | re.DOTALL)
             if m_e:
                 out["evidence"] = m_e.group(2).strip()
             else:
-                # フォールバック: 'evidence:' ラベル以降のテキストを抜粋
-                m_e2 = re.search(r"evidence\s*[:\-]\s*(.+)$", text, re.IGNORECASE | re.DOTALL)
+                m_e2 = re.search(r"evidence\s*[:：\-]\s*(.+)$", text, re.IGNORECASE | re.DOTALL)
                 if m_e2:
                     out["evidence"] = m_e2.group(1).strip()
 
             # details
-            m_d = re.search(r"['\"]?details['\"]?\s*:\s*([\"'])(.*?)\1", text, re.IGNORECASE | re.DOTALL)
+            m_d = re.search(r"['\"]?details['\"]?\s*[:：]\s*([\"'])(.*?)\1", text, re.IGNORECASE | re.DOTALL)
             if m_d:
                 out["details"] = m_d.group(2).strip()
             else:
-                m_d2 = re.search(r"details\s*[:\-]\s*(.+)$", text, re.IGNORECASE | re.DOTALL)
+                m_d2 = re.search(r"details\s*[:：\-]\s*(.+)$", text, re.IGNORECASE | re.DOTALL)
                 if m_d2:
                     out["details"] = m_d2.group(1).strip()
 
